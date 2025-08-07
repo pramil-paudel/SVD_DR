@@ -1,0 +1,194 @@
+function svd_digit_train()
+% svd_digit_train.m
+% Author: Pramil Paudel
+% Description: Train SVD-based model (event-by-event) and evaluate on training data.
+
+clc; clear;
+
+%% === Configuration ===
+train_csv = 'R:\TAPIA-TAKAKI_GRP\ML_Scratch\train.csv';
+num_classes = 10;
+
+%% === Load Training Data ===
+fprintf('📥 Loading training data from: %s\n', train_csv);
+[X_train, y_train] = load_digit_csv(train_csv, num_classes);
+fprintf('✅ Training data: %d samples, %d features\n', size(X_train,1), size(X_train,2));
+true_labels = get_label(y_train);
+
+%% === Training ===
+
+batch_size = 20;
+batch_counter = 0;
+
+fprintf('
+🚀 Training with Event-by-Event SVD...
+');
+class_svds = struct();
+train_log = [];
+
+for c = 0:num_classes-1
+    idx = find(true_labels == c);
+    n_samples = length(idx);
+
+    if n_samples < 1
+        warning('⚠️ No samples for class %d', c);
+        continue;
+    end
+
+    fprintf('🔧 Training class %d [%d samples]...', c, n_samples);
+
+    % Initialize with first sample
+    x0 = X_train(idx(1), :)';
+    [U, S, V] = svd(x0, 'econ');
+
+    n_updated = 0;
+    n_skipped = 0;
+
+    for i = 2:n_samples
+        xi = X_train(idx(i), :)';
+
+        % Batch-wise evaluation every N updates
+        batch_counter = batch_counter + 1;
+        if mod(batch_counter, batch_size) == 0
+            fprintf('📦 Batch %d: Evaluating intermediate model for class %d', batch_counter / batch_size, c);
+            [~, scores_so_far] = classify_with_svd(class_svds, X_train);
+            for class_eval = 0:num_classes-1
+                class_mask = (true_labels == class_eval);
+                if sum(class_mask) > 0 && sum(~class_mask) > 0
+                    [~, ~, ~, batch_auc] = perfcurve(class_mask, scores_so_far(:, class_eval+1), true);
+                    fprintf('📊 Batch ROC - Class %d: AUC = %.4f', class_eval, batch_auc);
+                else
+                    fprintf('⚠️ Skipping batch ROC for class %d (not enough samples)', class_eval);
+                end
+            end
+        end
+
+        [U, S, V, did_update] = event_by_event_svd(U, S, V, xi);
+
+        if did_update
+            fprintf('   [%3d/%3d] ✔ updated', i, n_samples);
+            n_updated = n_updated + 1;
+        else
+            fprintf('   [%3d/%3d] ✘ skipped (no update needed)', i, n_samples);
+            n_skipped = n_skipped + 1;
+        end
+    end
+
+    fprintf('✅ Done with class %d: %d updates, %d skipped (%.1f%% updated)', ...
+ c, n_updated, n_skipped, 100 * n_updated / (n_samples - 1));
+
+    class_svds(c+1).U = U;
+    class_svds(c+1).S = S;
+    class_svds(c+1).V = V;
+
+    train_log(c+1).class = c;
+    train_log(c+1).samples = n_samples;
+    train_log(c+1).updates = n_updated;
+    train_log(c+1).skipped = n_skipped;
+end
+
+%% === Classification on Training Data ===
+fprintf('\n🔍 Classifying training data...\n');
+[pred_labels, scores] = classify_with_svd(struct(), X_train);
+accuracy = mean(pred_labels == true_labels);
+fprintf('🎯 Training Accuracy: %.2f%%\n', accuracy * 100);
+
+%% === Plot ROC Curves ===
+fprintf('\n📊 Plotting ROC curves...\n');
+figure; hold on;
+auc_log = zeros(num_classes, 1);
+
+for c = 0:num_classes-1
+    class_mask = (true_labels == c);
+    if sum(class_mask) > 0 && sum(~class_mask) > 0
+        [Xroc, Yroc, ~, AUC] = perfcurve(class_mask, scores(:, c+1), true);
+        auc_log(c+1) = AUC;
+        plot(Xroc, Yroc, 'DisplayName', sprintf('Digit %d (AUC = %.2f)', c, AUC));
+    else
+        fprintf('⚠️ Skipping class %d for ROC (not enough positive or negative samples)\n', c);
+    end
+end
+
+xlabel('False Positive Rate'); ylabel('True Positive Rate');
+title('ROC Curves - Training Set');
+legend('show'); grid on;
+
+%% === Plot AUC Log ===
+figure; bar(0:num_classes-1, auc_log);
+xlabel('Digit Class'); ylabel('AUC Score');
+title('AUC Scores per Class');
+grid on;
+
+end
+
+%% === Helper Functions ===
+function [X, y_onehot] = load_digit_csv(filepath, num_classes)
+    opts = detectImportOptions(filepath);
+    data = readmatrix(filepath, opts);
+    y = data(:, 1);
+    X = data(:, 2:end);
+    X = double(X) / 255.0;
+    y_onehot = one_hot_encode(y, num_classes);
+end
+
+function y_encoded = one_hot_encode(labels, num_classes)
+    n = length(labels);
+    y_encoded = zeros(n, num_classes);
+    for i = 1:n
+        y_encoded(i, labels(i)+1) = 1;
+    end
+end
+
+function labels = get_label(y_onehot)
+    [~, labels] = max(y_onehot, [], 2);
+    labels = labels - 1;
+end
+
+function [U_new, S_new, V_new, did_update] = event_by_event_svd(U, S, V, A)
+    m = U' * A;
+    p = A - U * m;
+    P = orth(p);
+    if isempty(P)
+        U_new = U; S_new = S; V_new = V; did_update = false;
+        return;
+    end
+    Ra = P' * p;
+    z = zeros(size(m));
+    K = [S, m; z', Ra];
+    [tU, tSvec, tV] = svd(K, 'econ');
+    r = size(S, 1);
+    tU = tU(:, 1:r); tS = diag(tSvec(1:r)); tV = tV(:, 1:r);
+    U_new = [U, P] * tU;
+    V_top = V * tV(1:size(V,2), :);
+    V_bottom = tV(size(V,2)+1:end, :);
+    V_new = [V_top; V_bottom];
+    S_new = diag(tS);
+    did_update = true;
+end
+
+function [predicted_labels, scores] = classify_with_svd(class_svds, X)
+    n = size(X, 1);
+    num_classes = 10;
+    scores = zeros(n, num_classes);
+    predicted_labels = zeros(n, 1);
+
+    for i = 1:n
+        x = X(i, :)';
+        for c = 1:num_classes
+            if ~isfield(class_svds, num2str(c)) || isempty(class_svds)
+                scores(i, c) = -rand();
+                continue;
+            end
+            Uc = class_svds(c).U;
+            if size(Uc, 1) ~= size(x, 1)
+                scores(i, c) = -inf;
+                continue;
+            end
+            proj = Uc * (Uc' * x);
+            residual = norm(x - proj);
+            scores(i, c) = -residual;
+        end
+        [~, predicted_labels(i)] = max(scores(i, :));
+        predicted_labels(i) = predicted_labels(i) - 1;
+    end
+end

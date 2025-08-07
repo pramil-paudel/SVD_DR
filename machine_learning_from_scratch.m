@@ -1,0 +1,296 @@
+% svd_digit_train.m
+% Author: Pramil Paudel
+% Description: Train SVD-based model (event-by-event) and evaluate on training data.
+
+clc; clear;
+
+%% === Configuration ===
+train_csv = 'R:\TAPIA-TAKAKI_GRP\ML_Scratch\train.csv';
+num_classes = 10;
+
+%% === Load Training Data ===
+fprintf('📥 Loading training data from: %s\n', train_csv);
+[X_train, y_train] = load_digit_csv(train_csv, num_classes);
+fprintf('✅ Training data: %d samples, %d features\n', size(X_train,1), size(X_train,2));
+true_labels = get_label(y_train);
+
+fprintf('\n🚀 Training with Event-by-Event SVD...\n');
+class_svds = struct();
+train_log = [];
+
+for c = 0:num_classes-1
+    idx = find(true_labels == c);
+    n_samples = length(idx);
+
+    if n_samples < 1
+        warning('⚠️ No samples for class %d', c);
+        continue;
+    end
+
+    fprintf('🔧 Training class %d [%d samples]...\n', c, n_samples);
+
+    % Initialize with first sample
+    x0 = X_train(idx(1), :)';
+    [U, S, V] = svd(x0, 'econ');
+
+    n_updated = 0;
+    n_skipped = 0;
+
+    for i = 2:n_samples
+        xi = X_train(idx(i), :)';
+        [U, S, V, did_update] = event_by_event_svd(U, S, V, xi);
+
+        if did_update
+            fprintf('   [%3d/%3d] ✔ updated\n', i, n_samples);
+            n_updated = n_updated + 1;
+        else
+            fprintf('   [%3d/%3d] ✘ skipped (no update needed)\n', i, n_samples);
+            n_skipped = n_skipped + 1;
+        end
+    end
+
+    fprintf('✅ Done with class %d: %d updates, %d skipped (%.1f%% updated)\n\n', ...
+        c, n_updated, n_skipped, 100 * n_updated / (n_samples - 1));
+
+    class_svds(c+1).U = U;
+    class_svds(c+1).S = S;
+    class_svds(c+1).V = V;
+
+    % Store log
+    train_log(c+1).class = c;
+    train_log(c+1).samples = n_samples;
+    train_log(c+1).updates = n_updated;
+    train_log(c+1).skipped = n_skipped;
+end
+
+%% === Summary ===
+fprintf('\n📊 Event-by-Event Training Summary:\n');
+fprintf('Class | Samples | Updates | Skipped | Update %%\n');
+fprintf('------+---------+---------+---------+----------\n');
+for c = 0:num_classes-1
+    if length(train_log) < c+1 || isempty(train_log(c+1).samples)
+        continue;
+    end
+    row = train_log(c+1);
+    fprintf('%5d | %7d | %7d | %7d | %8.1f%%\n', ...
+        row.class, row.samples, row.updates, row.skipped, ...
+        100 * row.updates / (row.samples - 1));
+end
+
+%% === Classification on Training Data ===
+fprintf('\n🔍 Classifying training data...\n');
+[pred_labels, scores] = classify_with_svd(class_svds, X_train);
+
+accuracy = mean(pred_labels == true_labels);
+fprintf('🎯 Training Accuracy: %.2f%%\n', accuracy * 100);
+
+%% === Plot ROC Curves ===
+fprintf('\n📊 Plotting ROC curves...\n');
+figure; hold on;
+
+for c = 0:num_classes-1
+    [Xroc, Yroc, ~, AUC] = perfcurve(true_labels == c, scores(:, c+1), true);
+    plot(Xroc, Yroc, 'DisplayName', sprintf('Digit %d (AUC = %.2f)', c, AUC));
+end
+
+xlabel('False Positive Rate'); ylabel('True Positive Rate');
+title('ROC Curves - Training Set');
+legend('show'); grid on;
+
+function [X, y_onehot] = load_digit_csv(filepath, num_classes)
+    opts = detectImportOptions(filepath);
+    data = readmatrix(filepath, opts);
+    y = data(:, 1);             % Labels
+    X = data(:, 2:end);         % Pixels
+    X = double(X) / 255.0;
+    y_onehot = one_hot_encode(y, num_classes);
+end
+
+function y_encoded = one_hot_encode(labels, num_classes)
+    n = length(labels);
+    y_encoded = zeros(n, num_classes);
+    for i = 1:n
+        y_encoded(i, labels(i)+1) = 1;
+    end
+end
+
+function labels = get_label(y_onehot)
+    [~, labels] = max(y_onehot, [], 2);
+    labels = labels - 1;  % Zero-based
+end
+
+function [U_new, S_new, V_new, did_update] = event_by_event_svd(U, S, V, A)
+    m = U' * A;
+    p = A - U * m;
+    P = orth(p);
+    if isempty(P)
+        U_new = U; S_new = S; V_new = V; did_update = false;
+        return;
+    end
+    Ra = P' * p;
+    z = zeros(size(m));
+    K = [S, m; z', Ra];
+    [tU, tSvec, tV] = svd(K, 'econ');
+    r = size(S, 1);
+    tU = tU(:, 1:r); tS = diag(tSvec(1:r)); tV = tV(:, 1:r);
+    U_new = [U, P] * tU;
+    V_top = V * tV(1:size(V,2), :);
+    V_bottom = tV(size(V,2)+1:end, :);
+    V_new = [V_top; V_bottom];
+    S_new = diag(tS);
+    did_update = true;
+end
+
+function [predicted_labels, scores] = classify_with_svd(class_svds, X)
+    n = size(X, 1);
+    num_classes = length(class_svds);
+    scores = zeros(n, num_classes);
+    predicted_labels = zeros(n, 1);
+
+    for i = 1:n
+        x = X(i, :)';
+
+        for c = 1:num_classes
+            if ~isfield(class_svds(c), 'U') || isempty(class_svds(c).U)
+                scores(i, c) = -inf;  % Skip class if U is missing
+                continue;
+            end
+
+            Uc = class_svds(c).U;
+
+            % Catch dimensional mismatch
+            if size(Uc, 1) ~= size(x, 1)
+                warning('⚠️ Skipping class %d due to dimensional mismatch.', c-1);
+                scores(i, c) = -inf;
+                continue;
+            end
+
+            proj = Uc * (Uc' * x);
+            residual = norm(x - proj);
+            scores(i, c) = -residual;  % negative for similarity
+        end
+
+        [~, predicted_labels(i)] = max(scores(i, :));
+        predicted_labels(i) = predicted_labels(i) - 1;
+    end
+end
+
+
+%% === Testing Section ===
+fprintf('\n📥 Loading test data from: test.csv\n');
+test_feature_file = 'R:\TAPIA-TAKAKI_GRP\ML_Scratch\test.csv';
+test_label_file = 'R:\TAPIA-TAKAKI_GRP\ML_Scratch\mnist_submission.csv';
+
+% Load test feature matrix
+test_features = readmatrix(test_feature_file);
+
+% If test has 783 features, pad one zero column
+if size(test_features, 2) == 783
+    warning('⚠️ Test data has 783 features — padding 1 zero column.');
+    test_features(:, end+1) = 0;
+end
+
+X_test = double(test_features) / 255.0;
+
+% Load test labels from submission.csv
+fprintf('📥 Loading test labels from: submission.csv\n');
+submission = readtable(test_label_file);
+true_test_labels = submission.Label;
+
+% Sanity check
+if length(true_test_labels) ~= size(X_test, 1)
+    error('❌ Mismatch between test data and submission labels!');
+end
+
+%% === Classify Test Samples ===
+fprintf('\n🔍 Classifying test samples...\n');
+[pred_test_labels, test_scores] = classify_with_svd(class_svds, X_test);
+
+% Accuracy
+test_accuracy = mean(pred_test_labels == true_test_labels);
+fprintf('🎯 Test Accuracy: %.2f%%\n', test_accuracy * 100);
+
+fprintf('📊 Generating ROC curves for test set...\n');
+figure; hold on;
+
+for c = 0:num_classes-1
+    class_mask = (true_test_labels == c);
+    num_positive = sum(class_mask);
+    num_negative = sum(~class_mask);
+
+    if num_positive == 0 || num_negative == 0
+        fprintf('⚠️ Skipping ROC for class %d (only one class present)\n', c);
+        continue;
+    end
+
+    [Xroc, Yroc, ~, AUC] = perfcurve(class_mask, test_scores(:, c+1), true);
+    plot(Xroc, Yroc, 'DisplayName', sprintf('Digit %d (AUC = %.2f)', c, AUC));
+end
+
+xlabel('False Positive Rate'); ylabel('True Positive Rate');
+title('ROC Curves - Test Set');
+legend('show'); grid on;
+
+%% === Better ROC
+%% === Combined ROC Plot ===
+fprintf('\n📊 Generating combined ROC plot...\n');
+figure; hold on;
+
+colors = lines(num_classes);
+
+% ==== Figure 1: ROC: Train Per-Digit ====
+for c = 0:num_classes-1
+    class_mask = (true_labels == c);
+    [Xroc, Yroc, ~, AUC] = perfcurve(class_mask, scores(:, c+1), true);
+    plot(Xroc, Yroc, '-', 'Color', colors(c+1,:), 'LineWidth', 1.5, ...
+        'DisplayName', sprintf('Train - Digit %d (AUC=%.2f)', c, AUC));
+end
+
+% ==== Figure 2: ROC: Test Per-Digit ====
+for c = 0:num_classes-1
+    class_mask = (true_test_labels == c);
+    num_positive = sum(class_mask);
+    num_negative = sum(~class_mask);
+    if num_positive == 0 || num_negative == 0
+        fprintf('⚠️ Skipping test ROC for digit %d (only one class present)\n', c);
+        continue;
+    end
+    [Xroc, Yroc, ~, AUC] = perfcurve(class_mask, test_scores(:, c+1), true);
+    plot(Xroc, Yroc, '--', 'Color', colors(c+1,:), 'LineWidth', 1.5, ...
+        'DisplayName', sprintf('Test  - Digit %d (AUC=%.2f)', c, AUC));
+end
+
+%% === Figure 3: Clean Train vs Test ROC (Micro-Averaged Only) ===
+fprintf('\n📊 Drawing Figure 3: Train vs Test Micro-Averaged ROC...\n');
+
+figure(3); clf; hold on;
+
+% Recompute micro-averaged train ROC
+train_labels_bin = []; train_scores_bin = [];
+for c = 0:num_classes-1
+    train_labels_bin = [train_labels_bin; true_labels == c];
+    train_scores_bin = [train_scores_bin; scores(:, c+1)];
+end
+[Xmicro_tr, Ymicro_tr, ~, AUCmicro_tr] = perfcurve(train_labels_bin, train_scores_bin, true);
+
+% Recompute micro-averaged test ROC
+test_labels_bin = []; test_scores_bin = [];
+for c = 0:num_classes-1
+    test_labels_bin = [test_labels_bin; true_test_labels == c];
+    test_scores_bin = [test_scores_bin; test_scores(:, c+1)];
+end
+[Xmicro_te, Ymicro_te, ~, AUCmicro_te] = perfcurve(test_labels_bin, test_scores_bin, true);
+
+% Plot both curves
+plot(Xmicro_tr, Ymicro_tr, 'b-', 'LineWidth', 2.5, ...
+    'DisplayName', sprintf('Train Micro-Averaged (AUC = %.2f)', AUCmicro_tr));
+plot(Xmicro_te, Ymicro_te, 'r--', 'LineWidth', 2.5, ...
+    'DisplayName', sprintf('Test  Micro-Averaged (AUC = %.2f)', AUCmicro_te));
+
+% Style plot
+xlabel('False Positive Rate');
+ylabel('True Positive Rate');
+title('Figure 3: Micro-Averaged ROC (Train vs Test)');
+legend('show', 'Location', 'southeast');
+grid on;
+axis square;
